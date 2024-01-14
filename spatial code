@@ -1,0 +1,139 @@
+library(raster)
+library(tmap)
+library(sf)
+library(terra)
+library(tmaptools)
+library(grid)
+library(rnaturalearth)                                             
+library(sf)                                                                       
+world <- ne_countries()                                          
+world_sf= st_as_sf(world)                                  
+indonesia = world_sf[which(world_sf$sovereignt == 'Indonesia'),]
+setwd('/Users/baoyipeng/Desktop/2nd_Assignment-20231126/')
+getwd()
+PVOUT<- rast("PVOUT.tif")
+powerplants=read_sf("powerplants.csv")
+powerplants=st_as_sf(powerplants, coords = c("longitude", "latitude"))
+tmap_mode("view")
+powerplants$capacity_mw=as.numeric(powerplants$capacity_mw)
+map<-tm_shape(indonesia)+ tm_borders()+tm_shape(powerplants)+tm_dots(size="capacity_mw", col="type", style="cat",shape="status")+
+  tm_layout(title = "Indonesia powerplants",inner.margins = c(0.15,0.2,0.15,0.1),legend.position = c(0.02,0.1)) +tm_compass() +tm_scale_bar()
+tmap_save(map,"map.png")
+
+population=rast("population.tif")
+tm_shape(indonesia)+tm_polygons()+tm_shape(population)+ tm_raster(style = "fisher", n = 9,title = "Population")+tm_layout(title = "Distribution of Power Stations")+tm_compass() +tm_scale_bar() +tm_legend()
+
+tm_shape(indonesia) +
+  tm_borders() +
+  tm_shape(PVOUT) +
+  tm_raster(style = "fisher", n = 9, title = "PVOUT in kWh/kWp") +
+  tm_layout(title = "Distribution of Power Stations") +
+  tm_scale_bar() +
+  tm_legend(legend.position = c("left", "bottom"))
+
+library(ncdf4)
+era <- nc_open("data.nc" )
+lon <- ncvar_get(era, "longitude")
+lat <- ncvar_get(era, "latitude")
+time <- ncvar_get(era, "time")
+tunits <- ncatt_get(era,"time","units")
+lonlat <- as.matrix( (expand.grid(lon, lat)))
+library(lattice)
+library(RColorBrewer)
+
+ssrd_array <- ncvar_get(era,"ssrd")
+ssrd_slice <- ssrd_array[,,2] 
+length(na.omit(as.vector(ssrd_slice))) /length(as.vector(ssrd_slice)) 
+ssrd_vec <- as.vector( ssrd_slice) 
+ssrd_df <- data.frame( cbind( lonlat,ssrd_vec  ))
+colnames(ssrd_df) <- c("lon", "lat", "ssrd")
+ssrd_df_value <- na.omit (ssrd_df)
+head(ssrd_df_value, 3) 
+ssrd_sf<- st_as_sf( ssrd_df_value, coords = c(  "lon", "lat")  ) 
+st_crs(ssrd_sf) <- 4326 
+ssrd_sf <- st_transform(ssrd_sf, 4326 )
+tm_shape(ssrd_sf)+
+  tm_dots(col="ssrd", style = "quantile", size=.001, palette = "viridis")+tm_layout(title = "SSRD Visualization") +
+  tm_compass() +
+  tm_scale_bar() +tm_legend()
+ncatt_get(era,"ssrd","units")
+radiation_to_power <- function(G, A=1, r=0.175, p=0.6, hours=1){
+  kWh <- G * A * r * p * (hours/3600) / 1000
+  return(kWh)
+}
+ssrd_kwh <- as.data.frame (radiation_to_power (ssrd_df_value))
+ssrd_df_value <- cbind(ssrd_df_value,ssrd_kwh$ssrd)
+colnames(ssrd_df_value) [4] <- 'ssrd_kwh'
+ssrd_sf$ssrd_kwh = ssrd_kwh$ssrd
+
+tm_shape(ssrd_sf)+
+  tm_dots(col="ssrd_kwh", style = "quantile", size=.001, palette = "YlOrRd")+tm_layout(title = "Convert solar radiation to power") +
+  tm_compass() +
+  tm_scale_bar() +tm_legend()
+
+indonesia = st_transform(indonesia, st_crs(ssrd_sf))
+library("gstat")
+coor = as.data.frame(st_coordinates(ssrd_sf))
+ssrd_sf$x = coor$X
+ssrd_sf$y = coor$Y
+ssrd_nogeom = st_drop_geometry(ssrd_sf) 
+ssrd_nogeom=na.omit(ssrd_nogeom)
+a=na.omit(ssrd_vec)
+gs <- gstat(formula= a ~1, locations=~x+y, data=ssrd_nogeom, nmax=Inf, set=list(idp=2)) 
+raster_template = rast( resolution = 0.05,
+                        xmin=95.01079 , ymin=-11.00762  ,xmax=141.01940 , ymax=6.07693  ,  crs = st_crs(indonesia)$wkt)
+idw <- interpolate(raster_template, gs, debug.level=0) 
+par(mfrow=c(2, 1))
+plot(idw$var1.pred)
+idw_mask <- mask(idw, indonesia)
+plot(idw_mask$var1.pred)
+names(idw_mask) = c( "predicted","observed" )
+tm_shape(idw_mask$predicted) + tm_raster(col="predicted", style = "quantile", n = 10, palette= "Reds", legend.show = TRUE)+tm_compass() +
+  tm_scale_bar() +tm_legend()
+
+RMSE <- function(observed, predicted) {
+  sqrt(mean((predicted - observed)^2, na.rm=TRUE))
+}
+
+null <- RMSE(mean(ssrd_sf$ssrd_kwh), ssrd_sf$ssrd_kwh)
+n_idp = 10 
+n_fold =10
+
+rmse <- rep(NA, n_fold) 
+set.seed(7713)
+kf <- sample(1:n_fold, nrow(ssrd_nogeom), replace=TRUE)
+va = data.frame( c(1:n_idp), NA)
+colnames(va) =c("idp","rmse") 
+
+
+
+for (j in 1:n_idp) 
+{
+  for (i in 1:n_fold) {
+    test <- ssrd_nogeom[kf == 1, ]
+    train <- ssrd_nogeom[kf != 1, ]
+    b<- a[kf != 1 ]
+    gs <- gstat(formula= b ~1, locations=~x+y, data=train, nmax=Inf, set=list(idp=j)) 
+    pre = predict(gs, test, debug.level=0 )
+    rmse[i] <- RMSE(test$ssrd, pre$var1.pred)
+  }
+  va[j,2] = (mean(rmse) )
+}
+va[which(va$rmse==min(va)),]
+library(ggplot2)
+ggplot(va) +
+  geom_point(aes(x = idp, y= rmse))+
+  geom_hline(yintercept=min(va), linetype="dashed", color = "red")+
+  theme_classic()
+
+library(osmdata)
+library(tmap)
+library(sf)
+coords<-matrix(c(95.01079,141.01940,-11.00762, 6.07693),byrow = TRUE,nrow =2,ncol = 2, dimnames = list(c('x','y'),c('min','max')))
+location <- opq(coords)
+powerplant = add_osm_feature(location, key = 'power', value = 'line')
+powerplant.sf = osmdata_sf(powerplant)
+road=powerplant.sf$osm_lines
+tmap_mode("plot")
+tm_shape(indonesia) +
+  tm_borders() +tm_shape(road)+tm_lines(col='voltage')+tm_compass(position=c("right", "top"))+tm_layout(title = "Indonesia's gird line",inner.margins = c(0.2,0.2,0.3,0.01),legend.position = c(0.02,0.009),legend.height =  0.8)+tm_scale_bar() +tm_legend()
